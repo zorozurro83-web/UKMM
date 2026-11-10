@@ -156,3 +156,9 @@ x86_64-unknown-linux-gnu = "ubuntu-26.04"
 inherits = "release"
 lto = true
 codegen-units = 2
+
+[patch."https://github.com/GingerAvalanche/ryml.git"]
+ryml = { path = "patches/ryml" }
+
+[patch.crates-io]
+unrar_sys = { path = "patches/unrar_sys" }
