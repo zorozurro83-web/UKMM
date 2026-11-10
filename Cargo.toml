@@ -79,6 +79,7 @@ members = [
     "crates/uk-content",
     "crates/uk-content-derive",
     "crates/uk-localization",
+    "crates/uk-android",
     "crates/uk-manager",
     "crates/uk-mod",
     "crates/uk-reader",
