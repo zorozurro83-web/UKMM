@@ -12,6 +12,8 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ""
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -20,7 +22,7 @@ jobs:
           cmake-version: latest
       - name: Pasang NDK
         run: |
-          sdkmanager "ndk;27.2.12479018"
+          sdkmanager "ndk;27.2.12479018" "platforms;android-34" "build-tools;34.0.0"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
       - name: Build library Rust
         run: |
