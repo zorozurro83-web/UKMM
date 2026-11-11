@@ -47,9 +47,34 @@ class MainActivity : Activity() {
     // true = pakai Rust (konversi + merge UKMM). false = ekstrak mentah.
     private val useNative = true
 
-    // SEMENTARA: path dump romfs BOTW 1.6.0. Nanti ganti dengan tombol pilih dump.
-    private val dumpBase =
-        "/storage/emulated/0/Download/game port/zelda notw v 1.6.0 (01007EF00011E000)/romfs"
+    // Path dump romfs per versi game.
+    private val dumps = linkedMapOf(
+        "1.6.0" to "/storage/emulated/0/Download/game port/zelda notw v 1.6.0 (01007EF00011E000)/romfs",
+        "1.9.0" to "/storage/emulated/0/Download/game port/zelda botw v 1.9.0 (01007EF00011E000)/romfs"
+    )
+    private var gameVersion: String? = null
+    private lateinit var btnVersion: Button
+
+    private fun versionLabel() =
+        "Versi game: " + (gameVersion ?: "belum dipilih") + " (ketuk untuk ganti)"
+
+    private fun chooseVersion(cancelable: Boolean) {
+        val items = dumps.keys.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Pilih versi game untuk merge")
+            .setItems(items) { _, which ->
+                val v = items[which]
+                if (v != gameVersion) {
+                    gameVersion = v
+                    configured = false
+                    getSharedPreferences("ukmm", MODE_PRIVATE).edit()
+                        .putString("game_version", v).apply()
+                }
+                btnVersion.text = versionLabel()
+            }
+            .setCancelable(cancelable)
+            .show()
+    }
 
     // Nama folder hasil merge di dalam folder mod recomp.
     private val mergedName = "UKMM_merged"
@@ -73,6 +98,12 @@ class MainActivity : Activity() {
         title.text = Native.loadError?.let { "Gagal memuat library: $it" }
             ?: try { Native.version() } catch (e: Throwable) { "Gagal: $e" }
         root.addView(title)
+
+        gameVersion = getSharedPreferences("ukmm", MODE_PRIVATE).getString("game_version", null)
+        btnVersion = Button(this)
+        btnVersion.text = versionLabel()
+        btnVersion.setOnClickListener { chooseVersion(true) }
+        root.addView(btnVersion)
 
         val btnFolder = Button(this)
         btnFolder.text = "Pilih folder mod"
@@ -124,6 +155,7 @@ class MainActivity : Activity() {
 
         val tree = savedTree()
         if (tree != null) showFolder(tree)
+        if (gameVersion == null) chooseVersion(false)
     }
 
     // Rust membaca dump lewat path biasa, jadi butuh izin "Akses semua file".
@@ -322,6 +354,11 @@ class MainActivity : Activity() {
             dataDir.mkdirs()
 
             // 1. Konfigurasi (sekali per sesi): path dump game
+            val ver = gameVersion ?: throw Exception("Pilih versi game dulu")
+            val dumpBase = dumps[ver]!!
+            if (!File(dumpBase).isDirectory) {
+                throw Exception("Dump romfs $ver tidak ditemukan di: $dumpBase")
+            }
             if (!configured) {
                 val c = Native.configure(dataDir.absolutePath, dumpBase, "", "")
                 if (c != "OK") throw Exception("configure: $c")
