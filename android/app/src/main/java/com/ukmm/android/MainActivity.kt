@@ -4,9 +4,12 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
@@ -23,9 +26,11 @@ object Native {
         try { System.loadLibrary("uk_android") } catch (e: Throwable) { loadError = e.toString() }
     }
     @JvmStatic external fun version(): String
+    @JvmStatic external fun init(dataDir: String)
+    @JvmStatic external fun configure(dataDir: String, base: String, update: String, dlc: String): String
     @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
-    @JvmStatic external fun init(dataDir: String) 
-}  
+    @JvmStatic external fun merge(dataDir: String): String
+}
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
 
@@ -39,20 +44,33 @@ class MainActivity : Activity() {
     private val reqMod = 1002
     private val suffix = ".disabled"
 
-    // Ubah ke true setelah fungsi installBnp di Rust sudah selesai.
-    // false = ekstrak mentah seperti sebelumnya.
-    private val useNative = false
+    // true = pakai Rust (konversi + merge UKMM). false = ekstrak mentah.
+    private val useNative = true
+
+    // SEMENTARA: path dump romfs BOTW 1.6.0. Nanti ganti dengan tombol pilih dump.
+    private val dumpBase =
+        "/storage/emulated/0/Download/game port/zelda notw v 1.6.0 (01007EF00011E000)/romfs"
+
+    // Nama folder hasil merge di dalam folder mod recomp.
+    private val mergedName = "UKMM_merged"
+
+    private var configured = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-                if (Native.loadError == null) try { Native.init(File(filesDir, "ukmm_data").absolutePath) } catch (e: Throwable) {}
+
+        if (Native.loadError == null) {
+            try { Native.init(File(filesDir, "ukmm_data").absolutePath) } catch (e: Throwable) {}
+        }
+        requestAllFilesAccess()
+
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(48, 96, 48, 48)
 
         val title = TextView(this)
         title.textSize = 20f
-                title.text = Native.loadError?.let { "Gagal memuat library: $it" }
+        title.text = Native.loadError?.let { "Gagal memuat library: $it" }
             ?: try { Native.version() } catch (e: Throwable) { "Gagal: $e" }
         root.addView(title)
 
@@ -108,6 +126,24 @@ class MainActivity : Activity() {
         if (tree != null) showFolder(tree)
     }
 
+    // Rust membaca dump lewat path biasa, jadi butuh izin "Akses semua file".
+    // Manifest juga harus punya: android.permission.MANAGE_EXTERNAL_STORAGE
+    private fun requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+            try {
+                val i = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+                startActivity(i)
+            } catch (e: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                } catch (x: Exception) {}
+            }
+        }
+    }
+
     private fun savedTree(): Uri? {
         val s = getSharedPreferences("ukmm", MODE_PRIVATE).getString("mod_folder", null)
         return if (s == null) null else Uri.parse(s)
@@ -134,7 +170,7 @@ class MainActivity : Activity() {
             showFolder(uri)
         } else if (requestCode == reqMod) {
             val tree = savedTree() ?: return
-            status.text = "Mengimpor mod..."
+            status.text = "Mengimpor dan merge mod (bisa lama)..."
             Thread {
                 try {
                     val r = if (useNative) importBnp(uri, tree) else importBnpRaw(uri, tree)
@@ -145,8 +181,8 @@ class MainActivity : Activity() {
                     }
                 } catch (e: Throwable) {
                     runOnUiThread {
-                        status.text = "Gagal impor: $e"
                         showFolder(tree)
+                        status.text = "Gagal impor: $e"
                     }
                 }
             }.start()
@@ -218,7 +254,7 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- Impor .bnp: alur baru lewat Rust ----------
+    // ---------- Impor .bnp: alur lewat Rust (configure -> installBnp -> merge) ----------
 
     private fun copyToPrivate(uri: Uri): File {
         val dir = File(filesDir, "work").apply { mkdirs() }
@@ -253,32 +289,72 @@ class MainActivity : Activity() {
         }
     }
 
-    // Rust harus menulis hasil akhir ke <dataDir>/output/
+    // Hapus folder dengan nama tertentu di dalam folder mod (supaya impor ulang tidak jadi "(1)").
+    private fun deleteChildNamed(treeUri: Uri, name: String) {
+        try {
+            val treeId = DocumentsContract.getTreeDocumentId(treeUri)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeId)
+            val cols = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            )
+            val toDelete = ArrayList<Uri>()
+            contentResolver.query(children, cols, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    if (c.getString(1) == name) {
+                        toDelete.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(0)))
+                    }
+                }
+            }
+            for (u in toDelete) {
+                try { DocumentsContract.deleteDocument(contentResolver, u) } catch (x: Exception) {}
+            }
+        } catch (e: Exception) {}
+    }
+
     private fun importBnp(fileUri: Uri, treeUri: Uri): ImportResult {
-        val displayName = queryName(fileUri) ?: "mod"
-        val modName = displayName.substringBeforeLast('.')
         val work = File(filesDir, "work")
         val dataDir = File(filesDir, "ukmm_data")
-        val out = File(dataDir, "output")
+        val deploy = File(dataDir, "deploy")
         try {
             work.deleteRecursively()
-            out.deleteRecursively()
+            deploy.deleteRecursively()
             dataDir.mkdirs()
 
+            // 1. Konfigurasi (sekali per sesi): path dump game
+            if (!configured) {
+                val c = Native.configure(dataDir.absolutePath, dumpBase, "", "")
+                if (c != "OK") throw Exception("configure: $c")
+                configured = true
+            }
+
+            // 2. Konversi dan daftarkan .bnp
             val bnp = copyToPrivate(fileUri)
             val res = Native.installBnp(bnp.absolutePath, dataDir.absolutePath)
-            if (res != "OK") throw Exception(res)
+            if (res != "OK") throw Exception("install: $res")
+
+            // 3. Merge semua mod aktif dan deploy
+            val m = Native.merge(dataDir.absolutePath)
+            if (m != "OK") throw Exception("merge: $m")
+
+            // 4. Cari folder romfs hasil deploy
+            val romfs = deploy.walkTopDown()
+                .firstOrNull { it.isDirectory && it.name == "romfs" }
+                ?: throw Exception("Hasil merge tidak berisi folder romfs")
+            val out = romfs.parentFile!!
 
             val total = out.walkTopDown().count { it.isFile }
-            if (total == 0) throw Exception("Rust tidak menghasilkan file")
+            if (total == 0) throw Exception("Merge tidak menghasilkan file")
 
+            // 5. Salin ke folder mod recomp (ganti hasil merge sebelumnya)
+            deleteChildNamed(treeUri, mergedName)
             val parent = DocumentsContract.buildDocumentUriUsingTree(
                 treeUri, DocumentsContract.getTreeDocumentId(treeUri)
             )
             val modDir = DocumentsContract.createDocument(
                 contentResolver, parent,
-                DocumentsContract.Document.MIME_TYPE_DIR, modName
-            ) ?: throw Exception("Tidak bisa membuat folder $modName")
+                DocumentsContract.Document.MIME_TYPE_DIR, mergedName
+            ) ?: throw Exception("Tidak bisa membuat folder $mergedName")
 
             val failed = ArrayList<String>()
             copyTreeToSaf(out, modDir, failed)
@@ -291,7 +367,7 @@ class MainActivity : Activity() {
             return ImportResult(written, total, failed)
         } finally {
             work.deleteRecursively()
-            out.deleteRecursively()
+            deploy.deleteRecursively()
         }
     }
 
@@ -321,8 +397,6 @@ class MainActivity : Activity() {
         return created
     }
 
-    // Menambah satu entri arsip ke folder mod. Mengembalikan true kalau sebuah file berhasil ditulis.
-    // Kegagalan dicatat di daftar failed beserta alasannya.
     private fun addEntry(
         cache: HashMap<String, Uri>,
         rawName: String,
@@ -375,7 +449,6 @@ class MainActivity : Activity() {
         val displayName = queryName(fileUri) ?: "mod"
         val modName = displayName.substringBeforeLast('.')
 
-        // Salin dulu ke penyimpanan sementara supaya arsip bisa dibaca acak.
         val tmp = File(cacheDir, "import.tmp")
         try {
             val input = contentResolver.openInputStream(fileUri)
