@@ -23,8 +23,8 @@ object Native {
         try { System.loadLibrary("uk_android") } catch (e: Throwable) { loadError = e.toString() }
     }
     @JvmStatic external fun version(): String
-    ...
-      @JvmStatic external fun init(dataDir: String) 
+    @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
+    @JvmStatic external fun init(dataDir: String) 
 }  
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
