@@ -334,6 +334,9 @@ class MainActivity : Activity() {
             if (res != "OK") throw Exception("install: $res")
 
             // 3. Merge semua mod aktif dan deploy
+            // UKMM membersihkan folder ini sebelum merge, jadi harus sudah ada
+            File(dataDir, "storage/nx/profiles/Default/merged").mkdirs()
+            deploy.mkdirs()
             val m = Native.merge(dataDir.absolutePath)
             if (m != "OK") throw Exception("merge: $m")
 
