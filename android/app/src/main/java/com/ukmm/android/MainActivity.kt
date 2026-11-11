@@ -22,7 +22,8 @@ object Native {
     @JvmStatic external fun version(): String
     // Baru: dipanggil hanya kalau useNative = true
     @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
-}    @JvmStatic external fun init(dataDir: String)
+      @JvmStatic external fun init(dataDir: String) 
+}  
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
 
