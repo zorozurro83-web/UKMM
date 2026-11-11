@@ -22,7 +22,7 @@ object Native {
     @JvmStatic external fun version(): String
     // Baru: dipanggil hanya kalau useNative = true
     @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
-}
+}    @JvmStatic external fun init(dataDir: String)
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
 
@@ -42,7 +42,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        try { Native.init(File(filesDir, "ukmm_data").absolutePath) } catch (e: Throwable) {}
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(48, 96, 48, 48)
