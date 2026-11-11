@@ -20,6 +20,8 @@ import org.apache.commons.compress.archivers.sevenz.SevenZFile
 object Native {
     init { System.loadLibrary("uk_android") }
     @JvmStatic external fun version(): String
+    // Baru: dipanggil hanya kalau useNative = true
+    @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
 }
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
@@ -33,6 +35,10 @@ class MainActivity : Activity() {
     private val reqFolder = 1001
     private val reqMod = 1002
     private val suffix = ".disabled"
+
+    // Ubah ke true setelah fungsi installBnp di Rust sudah selesai.
+    // false = ekstrak mentah seperti sebelumnya.
+    private val useNative = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,10 +133,10 @@ class MainActivity : Activity() {
             status.text = "Mengimpor mod..."
             Thread {
                 try {
-                    val r = importBnp(uri, tree)
+                    val r = if (useNative) importBnp(uri, tree) else importBnpRaw(uri, tree)
                     runOnUiThread {
                         showFolder(tree)
-                        status.text = "Selesai: ${r.written} dari ${r.total} file diekstrak, ${r.failed.size} gagal"
+                        status.text = "Selesai: ${r.written} dari ${r.total} file diproses, ${r.failed.size} gagal"
                         if (r.failed.isNotEmpty()) showFailures(r)
                     }
                 } catch (e: Throwable) {
@@ -148,7 +154,7 @@ class MainActivity : Activity() {
         val more = r.failed.size - shown.size
         val text = shown.joinToString("\n") + if (more > 0) "\n... dan $more lainnya" else ""
         AlertDialog.Builder(this)
-            .setTitle("${r.failed.size} file gagal diekstrak")
+            .setTitle("${r.failed.size} file gagal")
             .setMessage(text)
             .setPositiveButton("Tutup", null)
             .show()
@@ -208,7 +214,84 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- Impor .bnp (7z, dengan cadangan zip) ----------
+    // ---------- Impor .bnp: alur baru lewat Rust ----------
+
+    private fun copyToPrivate(uri: Uri): File {
+        val dir = File(filesDir, "work").apply { mkdirs() }
+        val dst = File(dir, "in.bnp")
+        contentResolver.openInputStream(uri)!!.use { i ->
+            dst.outputStream().use { o -> i.copyTo(o) }
+        }
+        return dst
+    }
+
+    private fun copyTreeToSaf(src: File, parent: Uri, failed: ArrayList<String>) {
+        for (f in src.listFiles() ?: return) {
+            if (f.isDirectory) {
+                val d = DocumentsContract.createDocument(
+                    contentResolver, parent,
+                    DocumentsContract.Document.MIME_TYPE_DIR, f.name
+                )
+                if (d == null) { failed.add("${f.name}: gagal buat folder"); continue }
+                copyTreeToSaf(f, d, failed)
+            } else {
+                val d = DocumentsContract.createDocument(
+                    contentResolver, parent, "application/octet-stream", f.name
+                )
+                val out = d?.let { contentResolver.openOutputStream(it) }
+                if (out == null) { failed.add("${f.name}: gagal buat file"); continue }
+                try {
+                    out.use { o -> f.inputStream().use { it.copyTo(o) } }
+                } catch (e: Exception) {
+                    failed.add("${f.name}: ${e.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    // Rust harus menulis hasil akhir ke <dataDir>/output/
+    private fun importBnp(fileUri: Uri, treeUri: Uri): ImportResult {
+        val displayName = queryName(fileUri) ?: "mod"
+        val modName = displayName.substringBeforeLast('.')
+        val work = File(filesDir, "work")
+        val dataDir = File(filesDir, "ukmm_data")
+        val out = File(dataDir, "output")
+        try {
+            work.deleteRecursively()
+            out.deleteRecursively()
+            dataDir.mkdirs()
+
+            val bnp = copyToPrivate(fileUri)
+            val res = Native.installBnp(bnp.absolutePath, dataDir.absolutePath)
+            if (res != "OK") throw Exception(res)
+
+            val total = out.walkTopDown().count { it.isFile }
+            if (total == 0) throw Exception("Rust tidak menghasilkan file")
+
+            val parent = DocumentsContract.buildDocumentUriUsingTree(
+                treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+            )
+            val modDir = DocumentsContract.createDocument(
+                contentResolver, parent,
+                DocumentsContract.Document.MIME_TYPE_DIR, modName
+            ) ?: throw Exception("Tidak bisa membuat folder $modName")
+
+            val failed = ArrayList<String>()
+            copyTreeToSaf(out, modDir, failed)
+
+            val written = total - failed.size
+            if (written <= 0) {
+                try { DocumentsContract.deleteDocument(contentResolver, modDir) } catch (x: Exception) {}
+                throw Exception("Tidak ada file yang berhasil disalin")
+            }
+            return ImportResult(written, total, failed)
+        } finally {
+            work.deleteRecursively()
+            out.deleteRecursively()
+        }
+    }
+
+    // ---------- Impor .bnp: ekstrak mentah (7z, dengan cadangan zip) ----------
 
     private fun queryName(uri: Uri): String? {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
@@ -284,7 +367,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun importBnp(fileUri: Uri, treeUri: Uri): ImportResult {
+    private fun importBnpRaw(fileUri: Uri, treeUri: Uri): ImportResult {
         val displayName = queryName(fileUri) ?: "mod"
         val modName = displayName.substringBeforeLast('.')
 
