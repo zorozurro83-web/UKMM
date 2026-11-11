@@ -18,10 +18,12 @@ import java.util.zip.ZipInputStream
 import org.apache.commons.compress.archivers.sevenz.SevenZFile
 
 object Native {
-    init { System.loadLibrary("uk_android") }
+    var loadError: String? = null
+    init {
+        try { System.loadLibrary("uk_android") } catch (e: Throwable) { loadError = e.toString() }
+    }
     @JvmStatic external fun version(): String
-    // Baru: dipanggil hanya kalau useNative = true
-    @JvmStatic external fun installBnp(bnp: String, dataDir: String): String
+    ...
       @JvmStatic external fun init(dataDir: String) 
 }  
 
@@ -43,14 +45,15 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        try { Native.init(File(filesDir, "ukmm_data").absolutePath) } catch (e: Throwable) {}
+                if (Native.loadError == null) try { Native.init(File(filesDir, "ukmm_data").absolutePath) } catch (e: Throwable) {}
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(48, 96, 48, 48)
 
         val title = TextView(this)
         title.textSize = 20f
-        title.text = try { Native.version() } catch (e: Throwable) { "Gagal memuat library: $e" }
+                title.text = Native.loadError?.let { "Gagal memuat library: $it" }
+            ?: try { Native.version() } catch (e: Throwable) { "Gagal: $e" }
         root.addView(title)
 
         val btnFolder = Button(this)
