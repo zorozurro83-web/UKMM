@@ -76,6 +76,13 @@ fn opt_path(p: &str) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn do_configure(data: &str, base: &str, update: &str, dlc: &str) -> anyhow::Result<()> {
+    // DLC bersifat opsional (string kosong = tanpa DLC). Kalau diisi, harus
+    // folder romfs DLC (…/01007EF00011F001/romfs) yang berisi Pack/AocMainField.pack.
+    // Reader tidak memeriksa ini saat base game sudah ada, jadi path yang salah
+    // baru ketahuan di tengah merge dengan pesan yang membingungkan.
+    if !dlc.is_empty() && !Path::new(dlc).join("Pack/AocMainField.pack").is_file() {
+        anyhow::bail!("Folder DLC tidak valid (Pack/AocMainField.pack tidak ditemukan): {dlc}");
+    }
     let dump = ResourceReader::from_unpacked_dirs(
         opt_path(base),
         opt_path(update),
