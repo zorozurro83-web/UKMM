@@ -24,6 +24,8 @@ object Native {
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
 
+data class ImportResult(val written: Int, val total: Int, val failed: List<String>)
+
 class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var list: ListView
@@ -125,10 +127,11 @@ class MainActivity : Activity() {
             status.text = "Mengimpor mod..."
             Thread {
                 try {
-                    val n = importBnp(uri, tree)
+                    val r = importBnp(uri, tree)
                     runOnUiThread {
-                        status.text = "Selesai: $n file diekstrak"
                         showFolder(tree)
+                        status.text = "Selesai: ${r.written} dari ${r.total} file diekstrak, ${r.failed.size} gagal"
+                        if (r.failed.isNotEmpty()) showFailures(r)
                     }
                 } catch (e: Throwable) {
                     runOnUiThread {
@@ -138,6 +141,17 @@ class MainActivity : Activity() {
                 }
             }.start()
         }
+    }
+
+    private fun showFailures(r: ImportResult) {
+        val shown = r.failed.take(25)
+        val more = r.failed.size - shown.size
+        val text = shown.joinToString("\n") + if (more > 0) "\n... dan $more lainnya" else ""
+        AlertDialog.Builder(this)
+            .setTitle("${r.failed.size} file gagal diekstrak")
+            .setMessage(text)
+            .setPositiveButton("Tutup", null)
+            .show()
     }
 
     // ---------- Aktif/nonaktif dan hapus ----------
@@ -188,9 +202,8 @@ class MainActivity : Activity() {
                 false
             }
             runOnUiThread {
-                if (!ok) status.text = "Gagal menghapus"
                 showFolder(tree)
-                if (ok) status.text = "Terhapus: " + e.name.removeSuffix(suffix)
+                status.text = if (ok) "Terhapus: " + e.name.removeSuffix(suffix) else "Gagal menghapus"
             }
         }.start()
     }
@@ -221,15 +234,20 @@ class MainActivity : Activity() {
         return created
     }
 
-    // Menambah satu entri arsip ke folder mod. Mengembalikan true kalau sebuah file ditulis.
+    // Menambah satu entri arsip ke folder mod. Mengembalikan true kalau sebuah file berhasil ditulis.
+    // Kegagalan dicatat di daftar failed beserta alasannya.
     private fun addEntry(
         cache: HashMap<String, Uri>,
         rawName: String,
         isDir: Boolean,
+        failed: ArrayList<String>,
         writer: (OutputStream) -> Unit
     ): Boolean {
         val path = rawName.replace('\\', '/').trim('/')
-        if (path.isEmpty() || path.split('/').any { it == ".." }) return false
+        if (path.isEmpty() || path.split('/').any { it == ".." }) {
+            if (!isDir) failed.add("$rawName: nama tidak valid")
+            return false
+        }
         if (isDir) {
             ensureDir(cache, path)
             return false
@@ -237,19 +255,36 @@ class MainActivity : Activity() {
         val idx = path.lastIndexOf('/')
         val dirPath = if (idx < 0) "" else path.substring(0, idx)
         val fileName = path.substring(idx + 1)
-        val dir = ensureDir(cache, dirPath) ?: return false
+        val dir = ensureDir(cache, dirPath)
+        if (dir == null) {
+            failed.add("$path: gagal membuat folder")
+            return false
+        }
         val f = DocumentsContract.createDocument(
             contentResolver,
             dir,
             "application/octet-stream",
             fileName
-        ) ?: return false
-        val out = contentResolver.openOutputStream(f) ?: return false
-        out.use { writer(it) }
-        return true
+        )
+        if (f == null) {
+            failed.add("$path: gagal membuat file")
+            return false
+        }
+        val out = contentResolver.openOutputStream(f)
+        if (out == null) {
+            failed.add("$path: gagal membuka file tujuan")
+            return false
+        }
+        return try {
+            out.use { writer(it) }
+            true
+        } catch (ex: Exception) {
+            failed.add("$path: gagal menulis (${ex.javaClass.simpleName})")
+            false
+        }
     }
 
-    private fun importBnp(fileUri: Uri, treeUri: Uri): Int {
+    private fun importBnp(fileUri: Uri, treeUri: Uri): ImportResult {
         val displayName = queryName(fileUri) ?: "mod"
         val modName = displayName.substringBeforeLast('.')
 
@@ -278,7 +313,9 @@ class MainActivity : Activity() {
 
             val cache = HashMap<String, Uri>()
             cache[""] = modDir
+            val failed = ArrayList<String>()
             var count = 0
+            var total = 0
 
             try {
                 if (is7z) {
@@ -286,7 +323,8 @@ class MainActivity : Activity() {
                         var e = sz.nextEntry
                         while (e != null) {
                             val entry = e
-                            val wrote = addEntry(cache, entry.name, entry.isDirectory) { out ->
+                            if (!entry.isDirectory) total++
+                            val wrote = addEntry(cache, entry.name, entry.isDirectory, failed) { out ->
                                 val buf = ByteArray(65536)
                                 while (true) {
                                     val n = sz.read(buf)
@@ -303,7 +341,8 @@ class MainActivity : Activity() {
                         var e = zis.nextEntry
                         while (e != null) {
                             val entry = e
-                            val wrote = addEntry(cache, entry.name, entry.isDirectory) { out ->
+                            if (!entry.isDirectory) total++
+                            val wrote = addEntry(cache, entry.name, entry.isDirectory, failed) { out ->
                                 zis.copyTo(out)
                             }
                             if (wrote) count++
@@ -318,9 +357,10 @@ class MainActivity : Activity() {
 
             if (count == 0) {
                 try { DocumentsContract.deleteDocument(contentResolver, modDir) } catch (x: Exception) {}
-                throw Exception("Arsip kosong atau formatnya tidak dikenali")
+                val why = if (failed.isNotEmpty()) " (" + failed[0] + ")" else ""
+                throw Exception("Tidak ada file yang berhasil diekstrak$why")
             }
-            return count
+            return ImportResult(count, total, failed)
         } finally {
             tmp.delete()
         }
@@ -363,9 +403,7 @@ class MainActivity : Activity() {
                 "[AKTIF] " + it.name
             }
         }
-        if (!status.text.startsWith("Gagal")) {
-            status.text = "Isi folder: ${found.size} item. Ketuk item untuk opsi."
-        }
+        status.text = "Isi folder: ${found.size} item. Ketuk item untuk opsi."
         list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
     }
 }
