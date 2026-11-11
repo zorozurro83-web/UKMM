@@ -34,7 +34,12 @@ object Native {
 
 data class Entry(val uri: Uri, val name: String, val isDir: Boolean)
 
-data class ImportResult(val written: Int, val total: Int, val failed: List<String>)
+data class ImportResult(
+    val written: Int,
+    val total: Int,
+    val failed: List<String>,
+    val dlcNote: String? = null
+)
 
 class MainActivity : Activity() {
     private lateinit var status: TextView
@@ -52,6 +57,44 @@ class MainActivity : Activity() {
         "1.6.0" to "/storage/emulated/0/Download/game port/zelda notw v 1.6.0 (01007EF00011E000)/romfs",
         "1.9.0" to "/storage/emulated/0/Download/game port/zelda botw v 1.9.0 (01007EF00011E000)/romfs"
     )
+    // ---------- DLC ----------
+    // Folder induk semua dump, dan Title ID base game / DLC BOTW (Switch).
+    private val dumpRoot = "/storage/emulated/0/Download/game port"
+    // Folder lain tempat DLC dicari (tiap pack punya subfolder sendiri, mis. "DLC PACK 1").
+    // Pack yang tidak punya Pack/AocMainField.pack (mis. Pack 2: cuma System/AocVersion.txt)
+    // otomatis dilewati.
+    private val dlcRoots = listOf(
+        "/storage/emulated/0/Download/Mods/DLC",
+        dumpRoot
+    )
+    private val contentTitleId = "01007EF00011E000"
+    private val dlcTitleId = "01007EF00011F001"
+
+    // Isi kalau mau menentukan path DLC sendiri per versi, contoh:
+    // "1.6.0" to ".../zelda botw dlc (01007EF00011F001)/romfs"
+    // Kosong = dicari otomatis di dumpRoot.
+    private val dlcDumps = linkedMapOf<String, String>()
+
+    // Folder DLC yang valid berisi Pack/AocMainField.pack
+    private fun isValidDlc(dir: File) = File(dir, "Pack/AocMainField.pack").isFile
+
+    // Cari dump DLC: path manual dulu, lalu pindai dumpRoot.
+    // Kalau ada beberapa, pilih yang namanya memuat nomor versi game.
+    private fun findDlcDump(version: String): String? {
+        dlcDumps[version]?.let { if (isValidDlc(File(it))) return it }
+        val found = ArrayList<File>()
+        for (root in dlcRoots) {
+            for (child in File(root).listFiles() ?: emptyArray()) {
+                if (!child.isDirectory) continue
+                val romfs = File(child, "romfs")
+                if (isValidDlc(romfs)) found.add(romfs)
+                else if (isValidDlc(child)) found.add(child)
+            }
+        }
+        val best = found.firstOrNull { it.absolutePath.contains(version) } ?: found.firstOrNull()
+        return best?.absolutePath
+    }
+
     private var gameVersion: String? = null
     private lateinit var btnVersion: Button
 
@@ -78,8 +121,12 @@ class MainActivity : Activity() {
 
     // Nama folder hasil merge di dalam folder mod recomp.
     private val mergedName = "UKMM_merged"
+    // Hasil merge untuk DLC (romfs DLC dipisah dari romfs base game).
+    private val mergedDlcName = "UKMM_merged_DLC"
 
     private var configured = false
+    // Path DLC yang dipakai saat configure terakhir (null = tanpa DLC).
+    private var configuredDlc: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -208,7 +255,8 @@ class MainActivity : Activity() {
                     val r = if (useNative) importBnp(uri, tree) else importBnpRaw(uri, tree)
                     runOnUiThread {
                         showFolder(tree)
-                        status.text = "Selesai: ${r.written} dari ${r.total} file diproses, ${r.failed.size} gagal"
+                        status.text = "Selesai: ${r.written} dari ${r.total} file diproses, ${r.failed.size} gagal" +
+                            (r.dlcNote?.let { "\n$it" } ?: "")
                         if (r.failed.isNotEmpty()) showFailures(r)
                     }
                 } catch (e: Throwable) {
@@ -344,6 +392,40 @@ class MainActivity : Activity() {
         } catch (e: Exception) {}
     }
 
+    // Folder <deploy>/<titleId>/.../romfs -> kembalikan induknya (isinya "romfs/"), atau null.
+    private fun findDeployOutput(deploy: File, titleId: String): File? {
+        val titleDir = File(deploy, titleId)
+        if (!titleDir.isDirectory) return null
+        return titleDir.walkTopDown()
+            .firstOrNull { it.isDirectory && it.name == "romfs" }
+            ?.parentFile
+    }
+
+    // Salin satu hasil merge ke folder baru di folder mod. Mengembalikan jumlah file tertulis.
+    private fun copyOutput(
+        src: File, total: Int, treeUri: Uri, name: String,
+        failed: ArrayList<String>, tag: String
+    ): Int {
+        val parent = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        val dir = DocumentsContract.createDocument(
+            contentResolver, parent,
+            DocumentsContract.Document.MIME_TYPE_DIR, name
+        ) ?: throw Exception("Tidak bisa membuat folder $name")
+
+        val f = ArrayList<String>()
+        copyTreeToSaf(src, dir, f)
+        failed.addAll(f.map { tag + it })
+
+        val written = total - f.size
+        if (written <= 0) {
+            try { DocumentsContract.deleteDocument(contentResolver, dir) } catch (x: Exception) {}
+            throw Exception("$name: tidak ada file yang berhasil disalin")
+        }
+        return written
+    }
+
     private fun importBnp(fileUri: Uri, treeUri: Uri): ImportResult {
         val work = File(filesDir, "work")
         val dataDir = File(filesDir, "ukmm_data")
@@ -359,10 +441,13 @@ class MainActivity : Activity() {
             if (!File(dumpBase).isDirectory) {
                 throw Exception("Dump romfs $ver tidak ditemukan di: $dumpBase")
             }
-            if (!configured) {
-                val c = Native.configure(dataDir.absolutePath, dumpBase, "", "")
+            // DLC opsional: kalau dump DLC tidak ketemu, merge jalan tanpa DLC.
+            val dlcBase = findDlcDump(ver)
+            if (!configured || configuredDlc != dlcBase) {
+                val c = Native.configure(dataDir.absolutePath, dumpBase, "", dlcBase ?: "")
                 if (c != "OK") throw Exception("configure: $c")
                 configured = true
+                configuredDlc = dlcBase
             }
 
             // 2. Konversi dan daftarkan .bnp
@@ -377,34 +462,36 @@ class MainActivity : Activity() {
             val m = Native.merge(dataDir.absolutePath)
             if (m != "OK") throw Exception("merge: $m")
 
-            // 4. Cari folder romfs hasil deploy
-            val romfs = deploy.walkTopDown()
-                .firstOrNull { it.isDirectory && it.name == "romfs" }
-                ?: throw Exception("Hasil merge tidak berisi folder romfs")
-            val out = romfs.parentFile!!
+            // 4. Cari hasil deploy. Base game dan DLC masing-masing punya folder
+            //    <TitleID>/BreathOfTheWild_UKMM/romfs, jadi dicari per Title ID.
+            val out = findDeployOutput(deploy, contentTitleId)
+            val dlcOut = findDeployOutput(deploy, dlcTitleId)
 
-            val total = out.walkTopDown().count { it.isFile }
-            if (total == 0) throw Exception("Merge tidak menghasilkan file")
+            val total = out?.walkTopDown()?.count { it.isFile } ?: 0
+            val dlcTotal = dlcOut?.walkTopDown()?.count { it.isFile } ?: 0
+            if (total + dlcTotal == 0) throw Exception("Merge tidak menghasilkan file")
 
             // 5. Salin ke folder mod recomp (ganti hasil merge sebelumnya)
             deleteChildNamed(treeUri, mergedName)
-            val parent = DocumentsContract.buildDocumentUriUsingTree(
-                treeUri, DocumentsContract.getTreeDocumentId(treeUri)
-            )
-            val modDir = DocumentsContract.createDocument(
-                contentResolver, parent,
-                DocumentsContract.Document.MIME_TYPE_DIR, mergedName
-            ) ?: throw Exception("Tidak bisa membuat folder $mergedName")
+            deleteChildNamed(treeUri, mergedDlcName)
 
             val failed = ArrayList<String>()
-            copyTreeToSaf(out, modDir, failed)
-
-            val written = total - failed.size
-            if (written <= 0) {
-                try { DocumentsContract.deleteDocument(contentResolver, modDir) } catch (x: Exception) {}
-                throw Exception("Tidak ada file yang berhasil disalin")
+            var written = 0
+            if (out != null && total > 0) {
+                written += copyOutput(out, total, treeUri, mergedName, failed, "")
             }
-            return ImportResult(written, total, failed)
+            var dlcWritten = 0
+            if (dlcOut != null && dlcTotal > 0) {
+                dlcWritten = copyOutput(dlcOut, dlcTotal, treeUri, mergedDlcName, failed, "[DLC] ")
+            }
+
+            val dlcNote = when {
+                dlcBase == null ->
+                    "DLC: dump DLC tidak ditemukan di ${dlcRoots.joinToString(" / ")}, mod yang mengubah DLC dilewati"
+                dlcWritten > 0 -> "DLC: $dlcWritten file disalin ke $mergedDlcName"
+                else -> "DLC: dump terbaca, tidak ada file DLC yang berubah"
+            }
+            return ImportResult(written + dlcWritten, total + dlcTotal, failed, dlcNote)
         } finally {
             work.deleteRecursively()
             deploy.deleteRecursively()
