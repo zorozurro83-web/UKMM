@@ -8,4 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21"
+anyhow = { workspace = true }
+uk-content = { path = "../uk-content" }
 uk-manager = { path = "../uk-manager" }
+uk-reader = { path = "../uk-reader" }
