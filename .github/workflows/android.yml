@@ -33,6 +33,8 @@ jobs:
           printf 'set(ANDROID_ABI arm64-v8a)\nset(ANDROID_PLATFORM android-24)\ninclude("%s/build/cmake/android.toolchain.cmake")\n' "$ANDROID_NDK_HOME" > "$RUNNER_TEMP/android-arm64.cmake"
           export CMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/android-arm64.cmake"
           cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p uk-android
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" android/app/src/main/jniLibs/arm64-v8a/
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
