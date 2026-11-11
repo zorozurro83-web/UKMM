@@ -12,7 +12,10 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
+import java.io.File
+import java.io.OutputStream
 import java.util.zip.ZipInputStream
+import org.apache.commons.compress.archivers.sevenz.SevenZFile
 
 object Native {
     init { System.loadLibrary("uk_android") }
@@ -115,6 +118,7 @@ class MainActivity : Activity() {
             getSharedPreferences("ukmm", MODE_PRIVATE).edit()
                 .putString("mod_folder", uri.toString())
                 .apply()
+            status.text = ""
             showFolder(uri)
         } else if (requestCode == reqMod) {
             val tree = savedTree() ?: return
@@ -126,8 +130,11 @@ class MainActivity : Activity() {
                         status.text = "Selesai: $n file diekstrak"
                         showFolder(tree)
                     }
-                } catch (e: Exception) {
-                    runOnUiThread { status.text = "Gagal impor: $e" }
+                } catch (e: Throwable) {
+                    runOnUiThread {
+                        status.text = "Gagal impor: $e"
+                        showFolder(tree)
+                    }
                 }
             }.start()
         }
@@ -188,7 +195,7 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- Impor .bnp ----------
+    // ---------- Impor .bnp (7z, dengan cadangan zip) ----------
 
     private fun queryName(uri: Uri): String? {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
@@ -214,56 +221,109 @@ class MainActivity : Activity() {
         return created
     }
 
-    // .bnp adalah file zip. Fungsi ini mengekstraknya ke subfolder di folder mod.
+    // Menambah satu entri arsip ke folder mod. Mengembalikan true kalau sebuah file ditulis.
+    private fun addEntry(
+        cache: HashMap<String, Uri>,
+        rawName: String,
+        isDir: Boolean,
+        writer: (OutputStream) -> Unit
+    ): Boolean {
+        val path = rawName.replace('\\', '/').trim('/')
+        if (path.isEmpty() || path.split('/').any { it == ".." }) return false
+        if (isDir) {
+            ensureDir(cache, path)
+            return false
+        }
+        val idx = path.lastIndexOf('/')
+        val dirPath = if (idx < 0) "" else path.substring(0, idx)
+        val fileName = path.substring(idx + 1)
+        val dir = ensureDir(cache, dirPath) ?: return false
+        val f = DocumentsContract.createDocument(
+            contentResolver,
+            dir,
+            "application/octet-stream",
+            fileName
+        ) ?: return false
+        val out = contentResolver.openOutputStream(f) ?: return false
+        out.use { writer(it) }
+        return true
+    }
+
     private fun importBnp(fileUri: Uri, treeUri: Uri): Int {
         val displayName = queryName(fileUri) ?: "mod"
         val modName = displayName.substringBeforeLast('.')
-        val treeId = DocumentsContract.getTreeDocumentId(treeUri)
-        val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeId)
-        val modDir = DocumentsContract.createDocument(
-            contentResolver,
-            parent,
-            DocumentsContract.Document.MIME_TYPE_DIR,
-            modName
-        ) ?: throw Exception("Tidak bisa membuat folder $modName")
 
-        val cache = HashMap<String, Uri>()
-        cache[""] = modDir
-        var count = 0
+        // Salin dulu ke penyimpanan sementara supaya arsip bisa dibaca acak.
+        val tmp = File(cacheDir, "import.tmp")
+        try {
+            val input = contentResolver.openInputStream(fileUri)
+                ?: throw Exception("Tidak bisa membuka file mod")
+            input.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
 
-        val input = contentResolver.openInputStream(fileUri)
-            ?: throw Exception("Tidak bisa membuka file mod")
-        ZipInputStream(input).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                val path = entry.name.replace('\\', '/').trim('/')
-                val safe = path.isNotEmpty() && !path.split('/').any { it == ".." }
-                if (safe) {
-                    if (entry.isDirectory) {
-                        ensureDir(cache, path)
-                    } else {
-                        val idx = path.lastIndexOf('/')
-                        val dirPath = if (idx < 0) "" else path.substring(0, idx)
-                        val fileName = path.substring(idx + 1)
-                        val dir = ensureDir(cache, dirPath)
-                        if (dir != null) {
-                            val f = DocumentsContract.createDocument(
-                                contentResolver,
-                                dir,
-                                "application/octet-stream",
-                                fileName
-                            )
-                            if (f != null) {
-                                contentResolver.openOutputStream(f)?.use { out -> zis.copyTo(out) }
-                                count++
+            val head = ByteArray(6)
+            val read = tmp.inputStream().use { it.read(head) }
+            val is7z = read == 6 &&
+                head[0] == 0x37.toByte() && head[1] == 0x7A.toByte() &&
+                head[2] == 0xBC.toByte() && head[3] == 0xAF.toByte() &&
+                head[4] == 0x27.toByte() && head[5] == 0x1C.toByte()
+
+            val treeId = DocumentsContract.getTreeDocumentId(treeUri)
+            val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeId)
+            val modDir = DocumentsContract.createDocument(
+                contentResolver,
+                parent,
+                DocumentsContract.Document.MIME_TYPE_DIR,
+                modName
+            ) ?: throw Exception("Tidak bisa membuat folder $modName")
+
+            val cache = HashMap<String, Uri>()
+            cache[""] = modDir
+            var count = 0
+
+            try {
+                if (is7z) {
+                    SevenZFile(tmp).use { sz ->
+                        var e = sz.nextEntry
+                        while (e != null) {
+                            val entry = e
+                            val wrote = addEntry(cache, entry.name, entry.isDirectory) { out ->
+                                val buf = ByteArray(65536)
+                                while (true) {
+                                    val n = sz.read(buf)
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                }
                             }
+                            if (wrote) count++
+                            e = sz.nextEntry
+                        }
+                    }
+                } else {
+                    ZipInputStream(tmp.inputStream()).use { zis ->
+                        var e = zis.nextEntry
+                        while (e != null) {
+                            val entry = e
+                            val wrote = addEntry(cache, entry.name, entry.isDirectory) { out ->
+                                zis.copyTo(out)
+                            }
+                            if (wrote) count++
+                            e = zis.nextEntry
                         }
                     }
                 }
-                entry = zis.nextEntry
+            } catch (ex: Throwable) {
+                try { DocumentsContract.deleteDocument(contentResolver, modDir) } catch (x: Exception) {}
+                throw ex
             }
+
+            if (count == 0) {
+                try { DocumentsContract.deleteDocument(contentResolver, modDir) } catch (x: Exception) {}
+                throw Exception("Arsip kosong atau formatnya tidak dikenali")
+            }
+            return count
+        } finally {
+            tmp.delete()
         }
-        return count
     }
 
     // ---------- Daftar isi folder ----------
@@ -303,7 +363,9 @@ class MainActivity : Activity() {
                 "[AKTIF] " + it.name
             }
         }
-        status.text = "Isi folder: ${found.size} item. Ketuk item untuk opsi."
+        if (!status.text.startsWith("Gagal")) {
+            status.text = "Isi folder: ${found.size} item. Ketuk item untuk opsi."
+        }
         list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
     }
 }
