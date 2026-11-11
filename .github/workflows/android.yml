@@ -30,10 +30,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/stub"
           printf '!<arch>\n' > "$RUNNER_TEMP/stub/libpthread.a"
           export RUSTFLAGS="$RUSTFLAGS -C link-arg=-L$RUNNER_TEMP/stub"
-          export ANDROID_NDK="$ANDROID_NDK_HOME"
-          export CMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
-          export ANDROID_ABI=arm64-v8a
-          export ANDROID_PLATFORM=android-24
+          printf 'set(ANDROID_ABI arm64-v8a)\nset(ANDROID_PLATFORM android-24)\ninclude("%s/build/cmake/android.toolchain.cmake")\n' "$ANDROID_NDK_HOME" > "$RUNNER_TEMP/android-arm64.cmake"
+          export CMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/android-arm64.cmake"
           cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p uk-android
       - uses: gradle/actions/setup-gradle@v4
         with:
